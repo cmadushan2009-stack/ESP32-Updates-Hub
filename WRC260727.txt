@@ -1,0 +1,2033 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+
+// ------------------- PIN DEFINITIONS -------------------
+#define TRIG_PIN       5   // Ultrasonic Trig
+#define ECHO_PIN       18  // Ultrasonic Echo
+
+#define IN1_PIN        26  // Motor Driver IN1
+#define IN2_PIN        27  // Motor Driver IN2
+#define IN3_PIN        14  // Motor Driver IN3
+#define IN4_PIN        33  // Motor Driver IN4
+
+#define ARROW_LEFT_PIN 23  // Turn Signal Left (D23)
+#define ARROW_RIGHT_PIN 19 // Turn Signal Right (D19)
+
+#define HEADLIGHT_PIN  4   // Headlight (D4)
+#define LDR_PIN        34  // LDR Sensor (D34 - Analog)
+
+#define RED_PIN    13  // RGB Red (D13)
+#define GREEN_PIN  25  // RGB Green (D25)
+#define BLUE_PIN   32  // RGB Blue (D32)
+
+// PWM Configuration (ESP32 v3.x)
+#define PWM_FREQ       1000 // IC එක රත් වීම සහ Buzzer noise වැළැක්වීමට 1kHz ලෙස වෙනස් කරන ලදී
+#define PWM_RES        8
+#define HEADLIGHT_PWM_CHANNEL 4 // Headlight PWM Channel
+
+// OLED Screen setup (I2C SDA=D21, SCL=D22)
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// Async Web Server & WebSocket
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// Global System Variables
+bool isAPMode = true;
+bool isConnectedToWeb = false; // Remote Dashboard එක connect වී ඇත්දැයි බැලීමට
+String currentIP = "";
+int currentSpeed = 0;   // -100 to 100
+int currentSteer = 0;   // -100 to 100
+String sysMode = "RC";  // "RC" or "AUTO"
+bool isParked = false;
+
+// Headlight & LDR Logic
+bool manualLightState = false;
+bool autoLdrEnabled = false; // LDR auto mode flag (A button in settings)
+int currentLdrValue = 0;    // Live LDR Data Storage
+int headlightBrightness = 255; // Default 100% Brightness (0-255)
+// RGB Control Global Variables
+unsigned long autoPreviousMillis = 0;
+int autoState = 0;
+bool isRgbOn = false;
+int lastRgbR = 255;
+int lastRgbG = 0;
+int lastRgbB = 255; // Default Purple/Magenta Colour
+bool actualLightState = false; // Active status of Light
+
+// Face Blink Logic
+bool isBlinking = false;
+unsigned long lastBlinkTime = 0;
+
+// Display Mirroring Variables
+String activeWidget = "FACE"; // "FACE", "DATETIME", "TEXT", "SENSOR"
+String oledCustomText = "";
+String liveTimeStr = "00:00:00";
+String liveDateStr = "2026-01-01";
+
+// Internal Temperature Read
+#ifdef __cplusplus
+extern "C" {
+  uint8_t temprature_sens_read();
+}
+#endif
+
+// Helper function to set Headlight Output via PWM
+void setHeadlightHardware(bool state) {
+  actualLightState = state;
+  if (state) {
+    ledcWrite(HEADLIGHT_PIN, headlightBrightness);
+  } else {
+    ledcWrite(HEADLIGHT_PIN, 0);
+  }
+}
+
+// ------------------- HTML PAGES (PROGMEM) -------------------
+
+// 1. Wi-Fi Setup HTML Page
+const char WIFI_SETUP_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wi-Fi Setup</title>
+    <style>
+        :root {
+            --primary-glow: #00f2fe;
+            --glass-border: rgba(255, 255, 255, 0.1);
+        }
+        body {
+            background: radial-gradient(circle at center, #0f1026, #050510, #000000);
+            color: #ffffff;
+            font-family: 'Segoe UI', sans-serif;
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .wifi-card {
+            background: rgba(10, 15, 30, 0.95);
+            border: 1px solid var(--primary-glow);
+            border-radius: 18px;
+            padding: 25px;
+            width: 85%;
+            max-width: 320px;
+            box-shadow: 0 0 35px rgba(0, 242, 254, 0.35);
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .title {
+            font-size: 16px;
+            font-weight: 800;
+            color: var(--primary-glow);
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+        }
+        .input-label {
+            font-size: 10px;
+            font-weight: bold;
+            color: rgba(255, 255, 255, 0.7);
+        }
+        .modal-input {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid var(--primary-glow);
+            background: rgba(0, 0, 0, 0.6);
+            color: #fff;
+            font-size: 13px;
+            box-sizing: border-box;
+            outline: none;
+        }
+        .submit-btn {
+            background: var(--primary-glow);
+            color: #000;
+            border: none;
+            padding: 12px;
+            border-radius: 12px;
+            font-size: 13px;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 5px;
+            transition: all 0.2s ease;
+        }
+        .submit-btn:active {
+            transform: scale(0.97);
+            background: #00d2ff;
+        }
+    </style>
+</head>
+<body>
+    <div class="wifi-card">
+        <div class="title"> 📶 Connect Wi-Fi</div>
+        <div class="input-group">
+            <span class="input-label">Wi-Fi Name (SSID)</span>
+            <input type="text" id="wifi-ssid" class="modal-input" placeholder="Enter Wi-Fi Name">
+        </div>
+        <div class="input-group">
+            <span class="input-label">Password</span>
+            <input type="password" id="wifi-pass" class="modal-input" placeholder="Enter Password">
+        </div>
+        <button class="submit-btn" onclick="submitWifi()"> 🔗 Connect Wi-Fi</button>
+    </div>
+    <script>
+        let ws;
+        function initWebSocket() {
+            let wsGateway = `ws://${window.location.hostname}/ws`;
+            if(window.location.hostname === "") wsGateway = "ws://192.168.4.1/ws";
+            try { ws = new WebSocket(wsGateway); } catch(e) {}
+        }
+        function submitWifi() {
+            const ssid = document.getElementById('wifi-ssid').value.trim();
+            const pass = document.getElementById('wifi-pass').value.trim();
+            if (!ssid) {
+                alert("Please enter a Wi-Fi Name!");
+                return;
+            }
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send("WIFI_CONNECT_" + ssid + "_" + pass);
+            }
+            alert("Wi-Fi Credentials Sent!");
+        }
+        window.onload = initWebSocket;
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// 2. Main Remote HTML Page
+const char REMOTE_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Dynamic RC Cyber Dashboard</title>
+    <style>
+        :root {
+            --primary-glow: #00f2fe;
+            --neon-blue: #00d2ff;
+            --neon-red: #ff0055;
+            --neon-orange: #ff9900;
+            --neon-purple: #b624ff;
+            --glass-bg: rgba(255, 255, 255, 0.03);
+            --glass-border: rgba(255, 255, 255, 0.07);
+            --panel-bg: rgba(6, 10, 26, 0.95);
+            --center-box-bg: rgba(5, 10, 25, 0.6);
+        }
+
+        body {
+            background: radial-gradient(circle at center, #0f1026, #050510, #000000);
+            color: #ffffff;
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+            margin: 0;
+            padding: 10px 15px; 
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+            overflow-x: hidden;
+            position: relative;
+        }
+
+        body.nitro-active {
+            background: radial-gradient(circle at center, #3a0010, #100005, #000000);
+            animation: pulseBg 1s infinite alternate;
+        }
+
+        @keyframes pulseBg {
+            0% { background-color: #000000; }
+            100% { background-color: #120004; }
+        }
+
+        .top-status {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(10, 15, 30, 0.6);
+            backdrop-filter: blur(25px);
+            -webkit-backdrop-filter: blur(25px);
+            border: 1px solid var(--glass-border);
+            padding: 5px 10px; 
+            border-radius: 12px;
+            font-size: 10px; 
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.7);
+            z-index: 10;
+            margin-bottom: 5px;
+            transition: all 0.3s ease;
+        }
+
+        .status-left {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            flex-wrap: wrap;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: var(--glass-bg);
+            padding: 3px 8px; 
+            border-radius: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.02);
+            font-weight: 500;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.2s ease;
+        }
+
+        .status-item.temp-hot {
+            border-color: var(--neon-red);
+            box-shadow: 0 0 10px rgba(255, 0, 85, 0.4);
+            background: rgba(255, 50, 0, 0.15);
+        }
+
+        .status-item.temp-cold {
+            border-color: #00ffff;
+            box-shadow: 0 0 10px rgba(0, 255, 255, 0.4);
+            background: rgba(0, 200, 255, 0.15);
+        }
+
+        .temp-sun-icon { display: none; animation: spinSun 4s linear infinite; }
+        .temp-snow-icon { display: none; animation: snowFlake 1.5s infinite linear; }
+
+        .temp-hot .temp-sun-icon { display: inline-block; }
+        .temp-cold .temp-snow-icon { display: inline-block; }
+
+        @keyframes spinSun {
+            0% { transform: rotate(0deg) scale(1); }
+            50% { transform: rotate(180deg) scale(1.2); }
+            100% { transform: rotate(360deg) scale(1); }
+        }
+
+        @keyframes snowFlake {
+            0% { transform: translateY(-3px); opacity: 0.3; }
+            50% { opacity: 1; }
+            100% { transform: translateY(3px); opacity: 0.3; }
+        }
+
+        .horn-status-box.active-horn, .signal-status-box.active-signal {
+            display: flex !important;
+            animation: flashBadge 0.4s infinite alternate;
+        }
+
+        @keyframes flashBadge {
+            0% { opacity: 0.3; transform: scale(0.95); }
+            100% { opacity: 1; transform: scale(1.05); box-shadow: 0 0 12px var(--neon-orange); }
+        }
+
+        .bulb-status-box, .rgb-status-box, .horn-status-box, .signal-status-box {
+            display: none;
+            align-items: center;
+            gap: 3px;
+        }
+
+        .ws-status-badge {
+            font-size: 8px;
+            font-weight: bold;
+            padding: 2px 6px;
+            border-radius: 15px;
+            background: rgba(255, 0, 85, 0.15);
+            color: var(--neon-red);
+            border: 1px solid rgba(255, 0, 85, 0.3);
+        }
+
+        .ws-connected {
+            background: rgba(0, 242, 254, 0.15);
+            color: var(--primary-glow);
+            border: 1px solid rgba(0, 242, 254, 0.3);
+        }
+
+        .status-gear {
+            font-size: 15px;
+            color: rgba(255, 255, 255, 0.4);
+            cursor: pointer;
+            padding: 2px;
+            transition: transform 0.3s ease;
+        }
+
+        .status-gear:hover {
+            transform: rotate(90deg);
+            color: var(--primary-glow);
+        }
+
+        .settings-dropdown-panel {
+            position: absolute;
+            top: 45px; 
+            right: 10px; 
+            display: flex;
+            flex-direction: column; 
+            gap: 10px; 
+            background: var(--panel-bg);
+            padding: 12px; 
+            border-radius: 14px; 
+            border: 1px solid rgba(0, 242, 254, 0.25);
+            backdrop-filter: blur(30px);
+            opacity: 0;
+            transform: translateY(-10px) scale(0.95); 
+            pointer-events: none;
+            transition: all 0.3s ease;
+            width: 180px; 
+            z-index: 100;
+        }
+
+        .settings-dropdown-panel.show-panel {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+            pointer-events: auto;
+        }
+
+        .panel-label {
+            font-size: 8px; 
+            font-weight: 800; 
+        }
+
+        .horizontal-slider {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 3px;
+            background: rgba(255, 255, 255, 0.08);
+            outline: none;
+        }
+
+        .horizontal-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--primary-glow);
+            border: 1px solid #ffffff;
+        }
+
+        .color-picker-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .advanced-picker {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 40px;
+            height: 22px;
+            background: transparent;
+            border: none;
+            cursor: pointer;
+        }
+
+        .advanced-picker::-webkit-color-swatch {
+            border-radius: 5px;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+
+        .settings-btn {
+            background: rgba(0, 242, 254, 0.05);
+            border: 1px solid rgba(0, 242, 254, 0.3);
+            color: var(--primary-glow);
+            padding: 6px;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 9px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.2s ease;
+        }
+
+        .auto-a-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #fff;
+            padding: 6px;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 10px;
+            font-weight: bold;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            transition: all 0.2s ease;
+        }
+
+        .auto-a-btn.a-active {
+            background: rgba(0, 242, 254, 0.2);
+            border-color: var(--primary-glow);
+            color: var(--primary-glow);
+            box-shadow: 0 0 10px rgba(0, 242, 254, 0.3);
+        }
+
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(25px);
+            -webkit-backdrop-filter: blur(25px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+
+        .modal-overlay.show-modal {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .modal-box {
+            background: rgba(10, 15, 30, 0.95);
+            border: 1px solid var(--primary-glow);
+            border-radius: 18px;
+            padding: 22px;
+            width: 85%;
+            max-width: 310px;
+            box-shadow: 0 0 35px rgba(0, 242, 254, 0.35);
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            position: relative;
+        }
+
+        .modal-title {
+            font-size: 13px;
+            font-weight: 800;
+            color: var(--primary-glow);
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .modal-option-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--glass-border);
+            color: #ffffff;
+            padding: 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.2s ease;
+        }
+
+        .modal-option-btn:active {
+            background: rgba(0, 242, 254, 0.2);
+            border-color: var(--primary-glow);
+            transform: scale(0.97);
+        }
+
+        .modal-input {
+            width: 100%;
+            padding: 10px;
+            border-radius: 10px;
+            border: 1px solid var(--primary-glow);
+            background: rgba(0, 0, 0, 0.5);
+            color: #fff;
+            font-size: 12px;
+            box-sizing: border-box;
+            outline: none;
+            text-align: center;
+        }
+
+        .modal-close-btn {
+            position: absolute;
+            top: 10px;
+            right: 12px;
+            font-size: 16px;
+            color: rgba(255,255,255,0.6);
+            cursor: pointer;
+        }
+
+        .auto-mode-screen {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            flex: 1;
+            gap: 15px;
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 16px;
+            font-weight: bold;
+        }
+
+        .glass-btn {
+            background: linear-gradient(135deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+            border: 1px solid var(--glass-border);
+            color: rgba(255, 255, 255, 0.7);
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+            touch-action: none; 
+            -webkit-tap-highlight-color: transparent;
+            transition: all 0.15s ease;
+            cursor: pointer;
+        }
+
+        .horn-btn, .park-btn, .light-main-btn, .rgb-toggle-btn, .signal-btn {
+            width: 38px; 
+            height: 38px;
+            border-radius: 50%;
+            font-size: 14px; 
+        }
+
+        .horn-btn { color: var(--neon-blue); border-color: rgba(0, 210, 255, 0.2); }
+        .horn-btn.active {
+            background: linear-gradient(135deg, #00f2fe, #00d2ff) !important;
+            box-shadow: 0 0 12px rgba(0, 242, 254, 0.6) !important;
+            color: #000;
+        }
+
+        .nitro-btn {
+            font-size: 18px;
+            width: 46px; 
+            height: 46px;
+            border-radius: 50%;
+            background: rgba(255, 0, 85, 0.02);
+            border-color: rgba(255, 0, 85, 0.15);
+            color: var(--neon-red);
+        }
+
+        .nitro-btn.active {
+            background: linear-gradient(135deg, #ff0055, #ff5e00) !important;
+            box-shadow: 0 0 15px rgba(255, 0, 85, 0.7) !important;
+            color: #fff;
+        }
+
+        .park-btn {
+            background: rgba(255, 153, 0, 0.02);
+            border-color: rgba(255, 153, 0, 0.15);
+            color: var(--neon-orange);
+        }
+
+        .park-active {
+            background: linear-gradient(135deg, #ff9900, #ff5500) !important;
+            box-shadow: 0 0 12px rgba(255, 153, 0, 0.6) !important;
+            color: #fff;
+        }
+
+        .light-main-btn { color: #ffe600; border-color: rgba(255, 230, 0, 0.15); }
+        .light-active {
+            background: linear-gradient(135deg, #ffe600, #ff9900) !important;
+            box-shadow: 0 0 12px rgba(255, 230, 0, 0.6) !important;
+            color: #000;
+        }
+
+        .rgb-toggle-btn { color: var(--neon-purple); border-color: rgba(182, 36, 255, 0.15); }
+        .rgb-active {
+            background: linear-gradient(135deg, #b624ff, #8000ff) !important;
+            box-shadow: 0 0 12px rgba(182, 36, 255, 0.6) !important;
+            color: #fff;
+        }
+
+        .signal-btn {
+            color: var(--neon-orange);
+            border-color: rgba(255, 153, 0, 0.2);
+            font-size: 16px;
+        }
+
+        .signal-active {
+            background: linear-gradient(135deg, #ff9900, #ff5500) !important;
+            box-shadow: 0 0 12px rgba(255, 153, 0, 0.6) !important;
+            color: #fff;
+        }
+
+        .slider-container-vertical {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 160px; 
+            width: 42px;  
+            background: rgba(5, 5, 15, 0.4);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px; 
+            box-shadow: inset 0 4px 10px rgba(0,0,0,0.6);
+        }
+
+        .slider-container-horizontal {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 42px; 
+            width: 210px; 
+            background: rgba(5, 5, 15, 0.4);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px; 
+            padding: 0 8px;
+            box-shadow: inset 0 4px 10px rgba(0,0,0,0.6);
+        }
+
+        .vertical-slider {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 140px;
+            height: 30px; 
+            background: transparent; 
+            transform: rotate(-90deg);
+            outline: none;
+            cursor: pointer;
+            touch-action: none; 
+        }
+
+        .horizontal-steer-slider {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 30px;
+            background: transparent;
+            outline: none;
+            cursor: pointer;
+            touch-action: none;
+        }
+
+        .vertical-slider::-webkit-slider-thumb, 
+        .horizontal-steer-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 28px; 
+            height: 28px;
+            border-radius: 50%; 
+            background: radial-gradient(circle at 35% 35%, #ffffff, var(--primary-glow));
+            box-shadow: 0 0 10px rgba(0, 242, 254, 0.6);
+            border: 1.5px solid rgba(255,255,255,0.8);
+        }
+
+        .button-row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .center-box {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 32vw;
+            height: 32vw;
+            max-width: 220px;
+            max-height: 220px;
+            background: var(--center-box-bg);
+            border: 1px solid rgba(0, 210, 255, 0.3);
+            border-radius: 20px;
+            backdrop-filter: blur(20px);
+            box-shadow: inset 0 0 15px rgba(0, 210, 255, 0.15), 0 0 20px rgba(0, 0, 0, 0.8);
+            z-index: 5;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            overflow: hidden;
+            padding: 10px;
+            box-sizing: border-box;
+            transition: border-color 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .center-box:hover {
+            border-color: var(--primary-glow);
+            box-shadow: inset 0 0 20px rgba(0, 242, 254, 0.3), 0 0 25px rgba(0, 242, 254, 0.4);
+        }
+
+        .cyber-face {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            pointer-events: none;
+        }
+
+        .eyes-wrapper {
+            display: flex;
+            gap: 22px;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .eye {
+            width: 44px;
+            height: 44px;
+            background: var(--center-box-bg);
+            border: 2px solid var(--neon-blue);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            box-shadow: 0 0 12px rgba(0, 210, 255, 0.4), inset 0 0 8px rgba(0, 210, 255, 0.3);
+            transition: transform 0.1s ease;
+        }
+
+        .eye.blinking {
+            transform: scaleY(0.08) !important;
+        }
+
+        .iris {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: #00d2ff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            box-shadow: 0 0 10px #00d2ff;
+            transition: transform 0.1s ease-out;
+        }
+
+        .pupil {
+            width: 10px;
+            height: 10px;
+            background: #051020;
+            border-radius: 50%;
+            box-shadow: inset 0 0 3px #000000;
+        }
+
+        .cyber-mouth {
+            width: 32px;
+            height: 8px;
+            border-bottom: 3px solid var(--neon-blue);
+            border-radius: 0 0 12px 12px;
+            box-shadow: 0 3px 8px rgba(0, 210, 255, 0.5);
+            transition: all 0.3s ease;
+        }
+
+        .date-time-widget {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            text-align: center;
+            pointer-events: none;
+        }
+
+        .time-text {
+            font-size: 22px;
+            font-weight: 800;
+            color: var(--primary-glow);
+            text-shadow: 0 0 12px rgba(0, 242, 254, 0.6);
+            font-family: monospace;
+        }
+
+        .date-text {
+            font-size: 10px;
+            font-weight: 700;
+            color: rgba(255, 255, 255, 0.8);
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .text-widget-container {
+            display: none;
+            width: 100%;
+            height: 100%;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            position: relative;
+            pointer-events: none;
+        }
+
+        .custom-text-display {
+            font-size: 16px;
+            font-weight: 800;
+            color: var(--neon-orange);
+            text-shadow: 0 0 10px rgba(255, 153, 0, 0.8);
+            white-space: nowrap;
+            display: inline-block;
+        }
+
+        .marquee-active {
+            position: absolute;
+            animation: marqueeAnim 7s linear infinite;
+        }
+
+        @keyframes marqueeAnim {
+            0% { transform: translateX(100%); }
+            100% { transform: translateX(-100%); }
+        }
+
+        .sensor-widget-container {
+            display: none;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .sensor-card-ui {
+            font-size: 11px;
+            text-align: left;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            color: var(--primary-glow);
+            font-family: monospace;
+        }
+
+        .sensor-card-ui span {
+            color: #ffffff;
+            font-weight: bold;
+        }
+
+        .game-controls {
+            display: flex;
+            flex-direction: row; 
+            align-items: center;
+            justify-content: space-between;
+            flex: 1;
+            padding: 0 15px;
+            position: relative;
+        }
+
+        .left-controls-group, .right-controls-group {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            z-index: 10;
+        }
+
+        .toast-msg {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 242, 254, 0.9);
+            color: #000;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 12px;
+            box-shadow: 0 0 15px rgba(0,242,254,0.5);
+            z-index: 2000;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            pointer-events: none;
+        }
+
+        @media (orientation: portrait) {
+            .game-controls { flex-direction: column; gap: 20px; justify-content: center; }
+            .center-box { width: 40vw; height: 40vw; }
+        }
+    </style>
+</head>
+<body id="main-bg">
+
+    <div class="toast-msg" id="toast-box">Alert Message</div>
+
+    <div class="modal-overlay show-modal" id="start-mode-modal">
+        <div class="modal-box" onclick="event.stopPropagation()">
+            <div class="modal-title">Select System Mode</div>
+            <div class="modal-option-btn" onclick="initSelectedMode('RC')">🎮 RC Car Mode</div>
+            <div class="modal-option-btn" onclick="initSelectedMode('AUTO')">🤖 Auto Mode</div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="widget-modal" onclick="closeWidgetModal()">
+        <div class="modal-box" onclick="event.stopPropagation()">
+            <span class="modal-close-btn" onclick="closeWidgetModal()">✖</span>
+            <div class="modal-title">🔮 Select Widget</div>
+            
+            <div class="modal-option-btn" onclick="activateWidget('FACE')">🤖 Cyber Face Widget</div>
+            <div class="modal-option-btn" onclick="activateWidget('DATETIME')">📅 Date & Time Widget</div>
+            <div class="modal-option-btn" onclick="showTextInputField()">💬 Custom Text Widget</div>
+            <div class="modal-option-btn" onclick="activateWidget('SENSOR')">📡 Sensor Data Widget</div>
+
+            <div id="text-input-box" style="display: none; flex-direction: column; gap: 8px; margin-top: 5px;">
+                <input type="text" id="user-custom-text" class="modal-input" placeholder="Type text here..." maxlength="100">
+                <div class="modal-option-btn" style="background: var(--primary-glow); color: #000;" onclick="submitCustomTextWidget()">
+                    🚀 Apply (30 Seconds)
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="top-status" id="top-status-bar">
+        <div class="status-left">
+            <div id="sys-mode-display" style="font-weight: 800; color: rgba(255,255,255,0.9); letter-spacing: 0.5px;">🎮 RC CAR MODE</div>
+            <div class="status-item"><span id="ws-status" class="ws-status-badge">DISCONNECTED</span></div>
+            
+            <div class="status-item" id="temp-box">
+                <span class="temp-snow-icon">❄️</span>
+                <span class="temp-sun-icon">☀️</span>
+                <span id="temp-icon">🌡️</span> 
+                <span id="temp-display" style="color:var(--neon-orange); font-weight:bold;">34°C</span>
+            </div>
+
+            <div class="status-item" id="bat-box"><span id="bat-icon">🔋</span> <span id="bat-display" style="color:var(--primary-glow); font-weight:bold;">85%</span></div>
+            <div class="status-item" id="wifi-signal-box"><span> 📶 </span><span id="wifi-signal-text" style="color:var(--primary-glow); font-weight:bold;">100%</span></div>
+            <div class="status-item horn-status-box" id="horn-alert-container"><span>🔊</span> <span style="color: var(--primary-glow); font-weight:bold;">HORN</span></div>
+            <div class="status-item bulb-status-box" id="bulb-container"><span>💡</span> <span id="led-display" style="color: #ffe600; font-weight:bold;">LED: 100%</span></div>
+            <div class="status-item rgb-status-box" id="rgb-container"><span>✨</span> <span id="rgb-display" style="color: var(--neon-purple); font-weight:bold;">RGB ON</span></div>
+            
+            <div class="status-item" id="spd-box"><span style="color: rgba(255,255,255,0.4); font-size:8px; font-weight: bold;">SPD:</span> <span id="speed-display" style="color: var(--primary-glow); font-weight:bold; min-width:20px;">0%</span></div>
+            <div class="status-item" id="str-box"><span style="color: rgba(255,255,255,0.4); font-size:8px; font-weight: bold;">STR:</span> <span id="steer-display" style="color: var(--primary-glow); font-weight:bold; min-width:20px;">0%</span></div>
+        </div>
+        <div class="status-gear" id="gear-btn" onclick="toggleSettingsPanel(event)">⚙️</div>
+    </div>
+
+    <div class="settings-dropdown-panel" id="settings-panel" onclick="event.stopPropagation()">
+        <div class="auto-a-btn" id="auto-a-toggle" onclick="toggleAutoAButton()">
+            <span>🅰️ AUTO LIGHT (LDR)</span>
+            <span id="auto-a-status">OFF</span>
+        </div>
+        <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.06); margin: 4px 0;">
+        <div style="display: flex; flex-direction: column; gap: 6px;">
+            <div class="panel-label" style="color: #ffe600;">☀️ HEADLIGHT BRIGHTNESS</div>
+            <input type="range" min="0" max="100" value="100" class="horizontal-slider" id="headlight-slider" oninput="updateHeadlightBrightness(this.value)">
+        </div>
+        <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.06); margin: 4px 0;">
+        <div class="color-picker-row">
+            <div class="panel-label" style="color: var(--neon-purple);">✨ CAR RGB COLOR</div>
+            <input type="color" id="adv-color-picker" class="advanced-picker" value="#ffffff" oninput="pickCarColor(this.value)">
+        </div>
+        <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.06); margin: 4px 0;">
+        <div style="display: flex; flex-direction: column; gap: 6px;">
+            <div class="settings-btn" id="mode-btn" onclick="reopenModeModal()">⚡ MODE SELECT</div>
+            <div class="settings-btn" onclick="toggleFullScreen()">🖥️ FULLSCREEN MODE</div>
+        </div>
+    </div>
+
+    <div class="auto-mode-screen" id="auto-screen">
+        <div style="font-size: 40px;">🤖</div>
+        <div>AUTO MODE ACTIVE</div>
+    </div>
+
+    <div class="game-controls" id="rc-controls">
+        <div class="left-controls-group">
+            <div class="glass-btn nitro-btn" id="btn-nitro">🔥</div>
+            <div class="slider-container-vertical">
+                <input type="range" min="-100" max="100" value="0" class="vertical-slider" id="throttle-slider" oninput="updateSlider(this.value)">
+            </div>
+        </div>
+
+        <div class="center-box" onclick="openWidgetModal(event)">
+            <div class="cyber-face" id="widget-cyber-face">
+                <div class="eyes-wrapper">
+                    <div class="eye" id="eye-left"><div class="iris" id="iris-left"><div class="pupil"></div></div></div>
+                    <div class="eye" id="eye-right"><div class="iris" id="iris-right"><div class="pupil"></div></div></div>
+                </div>
+                <div class="cyber-mouth" id="bot-mouth"></div>
+            </div>
+
+            <div class="date-time-widget" id="widget-datetime">
+                <div class="time-text" id="live-time-display">00:00:00</div>
+                <div class="date-text" id="live-date-display">2026-01-01</div>
+            </div>
+
+            <div class="text-widget-container" id="widget-text-container">
+                <div class="custom-text-display" id="custom-text-element">HELLO</div>
+            </div>
+
+            <div class="sensor-widget-container" id="widget-sensor-container">
+                <div class="sensor-card-ui">
+                    <div>📏 DIST : <span id="ui-dist">0.0 cm</span></div>
+                    <div>☀️ LDR  : <span id="ui-ldr">0</span></div>
+                    <div>🌡️ TEMP : <span id="ui-temp">0 °C</span></div>
+                    <div>⚡ SPD  : <span id="ui-speed">0%</span></div>
+                    <div>🎯 STR  : <span id="ui-steer">0%</span></div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="right-controls-group">
+           
+            <div class="slider-container-horizontal">
+                <input type="range" min="-100" max="100" value="0" class="horizontal-steer-slider" id="steer-slider" oninput="updateSteerSlider(this.value)">
+            </div>
+
+            <div class="button-row">
+                <div class="glass-btn light-main-btn" id="light-btn">🔅</div>
+                <div class="glass-btn horn-btn" id="btn-horn">🔊</div>
+                <div class="glass-btn rgb-toggle-btn" id="rgb-toggle-btn" onclick="toggleRGB()">✨</div>
+                <div class="glass-btn park-btn" id="btn-park" onclick="toggleParkMode()">🛑</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const slider = document.getElementById('throttle-slider');
+        const steerSlider = document.getElementById('steer-slider');
+        const speedDisplay = document.getElementById('speed-display');
+        const steerDisplay = document.getElementById('steer-display');
+        const sysModeDisplay = document.getElementById('sys-mode-display');
+        
+        const settingsPanel = document.getElementById('settings-panel');
+        const gearBtn = document.getElementById('gear-btn');
+        const rgbToggleBtn = document.getElementById('rgb-toggle-btn');
+        const wsStatusBadge = document.getElementById('ws-status');
+        
+        const startModeModal = document.getElementById('start-mode-modal');
+        const widgetModal = document.getElementById('widget-modal');
+        const textInputBox = document.getElementById('text-input-box');
+        
+        const rcControls = document.getElementById('rc-controls');
+        const autoScreen = document.getElementById('auto-screen');
+        
+        const tempBox = document.getElementById('temp-box');
+        const tempDisplay = document.getElementById('temp-display');
+
+        const widgetFace = document.getElementById('widget-cyber-face');
+        const widgetDateTime = document.getElementById('widget-datetime');
+        const widgetTextContainer = document.getElementById('widget-text-container');
+        const widgetSensorContainer = document.getElementById('widget-sensor-container');
+        
+        const customTextElement = document.getElementById('custom-text-element');
+        const liveTimeDisplay = document.getElementById('live-time-display');
+        const liveDateDisplay = document.getElementById('live-date-display');
+
+        const eyeLeft = document.getElementById('eye-left');
+        const eyeRight = document.getElementById('eye-right');
+        const irisLeft = document.getElementById('iris-left');
+        const irisRight = document.getElementById('iris-right');
+
+        const bulbContainer = document.getElementById('bulb-container');
+        const ledDisplay = document.getElementById('led-display');
+        const rgbContainer = document.getElementById('rgb-container');
+        const hornAlertContainer = document.getElementById('horn-alert-container'); 
+        const signalStatusContainer = document.getElementById('signal-status-container');
+        const signalStatusText = document.getElementById('signal-status-text');
+        const lightBtn = document.getElementById('light-btn');
+        const parkBtn = document.getElementById('btn-park');
+        const signalLBtn = document.getElementById('btn-signal-l');
+        const signalRBtn = document.getElementById('btn-signal-r');
+        const bodyBg = document.getElementById('main-bg');
+        const toastBox = document.getElementById('toast-box');
+
+        const autoAToggle = document.getElementById('auto-a-toggle');
+        const autoAStatus = document.getElementById('auto-a-status');
+        let isAutoAEnabled = false;
+
+        let currentSteerX = 0;
+        let currentThrottleY = 0;
+        let activeWidget = "FACE";
+        let textTimer = null;
+        let dateTimeInterval = null;
+
+        let isLightOn = false;
+        let isParkMode = false; 
+        let isRGBOn = false;
+        let activeSignal = null; 
+        let currentSystemMode = "RC"; 
+
+        function showToast(msg) {
+            toastBox.innerText = msg;
+            toastBox.style.opacity = '1';
+            setTimeout(() => { toastBox.style.opacity = '0'; }, 2500);
+        }
+
+        function triggerHapticFeedback() {
+            if (navigator.vibrate) { navigator.vibrate(45); }
+        }
+
+        let ws;
+        function initWebSocket() {
+            let wsGateway = `ws://${window.location.hostname}/ws`;
+            if(window.location.hostname === "") { wsGateway = "ws://192.168.4.1/ws"; }
+            try {
+                ws = new WebSocket(wsGateway);
+                ws.onopen = function() {
+                    wsStatusBadge.innerText = "LIVE";
+                    wsStatusBadge.classList.add('ws-connected');
+                    sendCmd("CLIENT_CONNECTED"); 
+                };
+                ws.onclose = function() {
+                    wsStatusBadge.innerText = "OFF";
+                    wsStatusBadge.classList.remove('ws-connected');
+                    setTimeout(initWebSocket, 2000); 
+                };
+            } catch(e) {}
+        }
+
+        document.addEventListener('click', function(e) {
+            if (settingsPanel.classList.contains('show-panel') && !settingsPanel.contains(e.target) && !gearBtn.contains(e.target)) {
+                settingsPanel.classList.remove('show-panel');
+            }
+        });
+
+        function toggleSettingsPanel(e) {
+            if(e) e.stopPropagation();
+            settingsPanel.classList.toggle('show-panel');
+        }
+
+        function reopenModeModal() {
+            settingsPanel.classList.remove('show-panel');
+            startModeModal.classList.add('show-modal');
+        }
+
+        function toggleFullScreen() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(() => {});
+            } else {
+                if (document.exitFullscreen) document.exitFullscreen();
+            }
+            settingsPanel.classList.remove('show-panel');
+        }
+
+        function toggleAutoAButton() {
+            isAutoAEnabled = !isAutoAEnabled;
+            if(isAutoAEnabled) {
+                autoAToggle.classList.add('a-active');
+                autoAStatus.innerText = "ON";
+            } else {
+                autoAToggle.classList.remove('a-active');
+                autoAStatus.innerText = "OFF";
+            }
+            sendCmd("TOGGLE_AUTO_LDR");
+        }
+
+        function updateHeadlightBrightness(val) {
+            let pct = Math.round((val / 100) * 100);
+            ledDisplay.innerText = "LED: " + pct + "%";
+            sendCmd("HEADLIGHT_BRIGHTNESS_" + val);
+        }
+
+        function pickCarColor(colorHex) {
+            sendCmd("RGB_COLOR_" + colorHex.replace('#', ''));
+        }
+
+        let lightBtnPressTimer = null;
+        let isLongPress = false;
+
+        function handleLightPressStart(e) {
+            if(e) e.preventDefault();
+            isLongPress = false;
+            lightBtnPressTimer = setTimeout(() => {
+                isLongPress = true;
+                toggleAutoAButton();
+                triggerHapticFeedback();
+            }, 3000);
+        }
+
+        function handleLightPressEnd(e) {
+            if(e) e.preventDefault();
+            clearTimeout(lightBtnPressTimer);
+            if (!isLongPress) {
+                toggleHeadlight();
+            }
+        }
+
+        lightBtn.addEventListener('touchstart', handleLightPressStart, {passive: false});
+        lightBtn.addEventListener('touchend', handleLightPressEnd, {passive: false});
+        lightBtn.addEventListener('mousedown', handleLightPressStart);
+        lightBtn.addEventListener('mouseup', handleLightPressEnd);
+
+        function toggleHeadlight() {
+            isLightOn = !isLightOn;
+            updateLightUIState(isLightOn);
+            if(isLightOn) {
+                sendCmd("LIGHT_ON");
+            } else {
+                sendCmd("LIGHT_OFF");
+            }
+        }
+
+        function updateLightUIState(state) {
+            isLightOn = state;
+            if(isLightOn) {
+                lightBtn.classList.add('light-active');
+                bulbContainer.style.display = 'flex';
+            } else {
+                lightBtn.classList.remove('light-active');
+                bulbContainer.style.display = 'none';
+            }
+        }
+
+        function toggleRGB() {
+            isRGBOn = !isRGBOn;
+            if(isRGBOn) {
+                rgbToggleBtn.classList.add('rgb-active');
+                rgbContainer.style.display = 'flex';
+                sendCmd("RGB_ON");
+            } else {
+                rgbToggleBtn.classList.remove('rgb-active');
+                rgbContainer.style.display = 'none';
+                sendCmd("RGB_OFF");
+            }
+        }
+
+        function toggleParkMode() {
+            isParkMode = !isParkMode;
+            if(isParkMode) {
+                parkBtn.classList.add('park-active');
+                resetSlider();
+                resetSteerSlider();
+                sendCmd("PARK_ON");
+            } else {
+                parkBtn.classList.remove('park-active');
+                sendCmd("PARK_OFF");
+            }
+        }
+
+        function toggleSignal(dir) {
+            if(activeSignal === dir) {
+                activeSignal = null;
+                signalLBtn.classList.remove('signal-active');
+                signalRBtn.classList.remove('signal-active');
+                signalStatusContainer.classList.remove('active-signal');
+                sendCmd("SIGNAL_OFF");
+            } else {
+                activeSignal = dir;
+                signalLBtn.classList.toggle('signal-active', dir === 'L');
+                signalRBtn.classList.toggle('signal-active', dir === 'R');
+                signalStatusText.innerText = dir === 'L' ? "L-SIGNAL" : "R-SIGNAL";
+                signalStatusContainer.classList.add('active-signal');
+                sendCmd("SIGNAL_" + dir);
+            }
+        }
+
+        function openWidgetModal(e) {
+            if(e) e.stopPropagation();
+            widgetModal.classList.add('show-modal');
+            textInputBox.style.display = "none";
+        }
+
+        function closeWidgetModal() {
+            widgetModal.classList.remove('show-modal');
+        }
+
+        function showTextInputField() {
+            textInputBox.style.display = "flex";
+        }
+
+        function activateWidget(type) {
+            activeWidget = type;
+
+            widgetFace.style.display = "none";
+            widgetDateTime.style.display = "none";
+            widgetTextContainer.style.display = "none";
+            widgetSensorContainer.style.display = "none";
+
+            if (dateTimeInterval) clearInterval(dateTimeInterval);
+            if (textTimer) clearTimeout(textTimer);
+
+            if (type === 'FACE') {
+                widgetFace.style.display = "flex";
+            } else if (type === 'DATETIME') {
+                widgetDateTime.style.display = "flex";
+                updateDateTime();
+                dateTimeInterval = setInterval(updateDateTime, 1000);
+            } else if (type === 'SENSOR') {
+                widgetSensorContainer.style.display = "flex";
+            }
+
+            sendCmd("WIDGET_" + type);
+            closeWidgetModal();
+        }
+
+        function updateDateTime() {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('en-US', { hour12: false });
+            const dateStr = now.toISOString().split('T')[0];
+            
+            liveTimeDisplay.innerText = timeStr;
+            liveDateDisplay.innerText = dateStr;
+
+            if (activeWidget === 'DATETIME') {
+                sendCmd("DATETIME_" + timeStr + "_" + dateStr);
+            }
+        }
+
+        function submitCustomTextWidget() {
+            const userText = document.getElementById('user-custom-text').value.trim();
+            if (!userText) return;
+
+            activeWidget = "TEXT";
+            widgetFace.style.display = "none";
+            widgetDateTime.style.display = "none";
+            widgetSensorContainer.style.display = "none";
+            widgetTextContainer.style.display = "flex";
+
+            customTextElement.innerText = userText;
+            customTextElement.classList.remove('marquee-active');
+
+            const parentWidth = document.querySelector('.center-box').clientWidth - 20;
+            if (customTextElement.scrollWidth > parentWidth) {
+                customTextElement.classList.add('marquee-active');
+            }
+
+            sendCmd("CUSTOM_TEXT_" + userText);
+            closeWidgetModal();
+
+            if (textTimer) clearTimeout(textTimer);
+            textTimer = setTimeout(() => {
+                activateWidget('FACE');
+            }, 30000);
+        }
+
+        function updateTemperatureUI(tempVal) {
+            tempDisplay.innerText = tempVal + "°C";
+            tempBox.classList.remove('temp-hot', 'temp-cold');
+            if(tempVal > 38) tempBox.classList.add('temp-hot');
+            else if(tempVal < 20) tempBox.classList.add('temp-cold');
+        }
+
+        function sendCmd(cmd, urgent = false) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(cmd);
+            }
+        }
+
+        function updateEyePosition() {
+            if(isParkMode || activeWidget !== "FACE") return;
+            let moveX = (currentSteerX / 100) * 8;
+            let moveY = -(currentThrottleY / 100) * 7; 
+            irisLeft.style.transform = `translate(${moveX}px, ${moveY}px)`;
+            irisRight.style.transform = `translate(${moveX}px, ${moveY}px)`;
+        }
+
+        function initSelectedMode(mode) {
+            currentSystemMode = mode;
+            startModeModal.classList.remove('show-modal');
+            if(mode === 'RC') {
+                rcControls.style.display = "flex";
+                autoScreen.style.display = "none";
+                sysModeDisplay.innerText = "🎮 RC CAR MODE";
+                sendCmd("MODE_RC");
+            } else if(mode === 'AUTO') {
+                rcControls.style.display = "none";
+                autoScreen.style.display = "flex";
+                sysModeDisplay.innerText = "🤖 AUTO MODE";
+                sendCmd("MODE_AUTO");
+            }
+        }
+
+        function setupSensitiveButton(id, startCallback, endCallback, isToggle = false) {
+            let btn = document.getElementById(id);
+            if(!btn) return;
+            
+            const handleStart = (e) => {
+                if(e) e.preventDefault();
+                if(!isToggle) btn.classList.add('active');
+                if(startCallback) startCallback();
+            };
+
+            const handleEnd = (e) => {
+                if(e) e.preventDefault();
+                if(!isToggle) btn.classList.remove('active');
+                if(endCallback) endCallback();
+            };
+
+            btn.addEventListener('touchstart', handleStart, {passive: false});
+            btn.addEventListener('touchend', handleEnd, {passive: false});
+            btn.addEventListener('mousedown', handleStart);
+            btn.addEventListener('mouseup', handleEnd);
+            btn.addEventListener('mouseleave', () => { if(!isToggle) btn.classList.remove('active'); });
+        }
+
+        setupSensitiveButton('btn-nitro', () => {
+            if(isParkMode) return;
+            bodyBg.classList.add('nitro-active');
+            speedDisplay.innerText = "100%";
+            slider.value = 100;
+            currentThrottleY = 100;
+            updateEyePosition();
+            sendCmd('SPEED_100', true);
+        }, () => {
+            if(isParkMode) return;
+            bodyBg.classList.remove('nitro-active');
+            resetSlider();
+        });
+
+        setupSensitiveButton('btn-horn', () => {
+            hornAlertContainer.classList.add('active-horn');
+            sendCmd('HORN_ON', true);
+        }, () => {
+            hornAlertContainer.classList.remove('active-horn');
+            sendCmd('HORN_OFF', true);
+        });
+
+        let throttleSnapped = false;
+        let steerSnapped = false;
+
+        function updateSlider(val) {
+            if(isParkMode) { slider.value = 0; speedDisplay.innerText = "0%"; return; }
+            
+            let parsedVal = parseInt(val);
+
+            if (parsedVal === 0) {
+                if (!throttleSnapped) {
+                    triggerHapticFeedback(); 
+                    throttleSnapped = true;
+                }
+            } else {
+                throttleSnapped = false;
+            }
+
+            currentThrottleY = parsedVal;
+            speedDisplay.innerText = parsedVal + "%";
+            document.getElementById('ui-speed').innerText = parsedVal + "%";
+            updateEyePosition();
+            sendCmd("SPEED_" + parsedVal);
+        }
+
+        function updateSteerSlider(val) {
+            if(isParkMode) { steerSlider.value = 0; steerDisplay.innerText = "0%"; return; }
+            
+            let parsedVal = parseInt(val);
+
+            if (parsedVal === 0) {
+                if (!steerSnapped) {
+                    triggerHapticFeedback(); 
+                    steerSnapped = true;
+                }
+            } else {
+                steerSnapped = false;
+            }
+
+            currentSteerX = parsedVal;
+            steerDisplay.innerText = parsedVal + "%";
+            document.getElementById('ui-steer').innerText = parsedVal + "%";
+            updateEyePosition();
+            sendCmd("STEER_" + parsedVal);
+        }
+
+        function resetSlider() { slider.value = 0; updateSlider(0); }
+        function resetSteerSlider() { steerSlider.value = 0; updateSteerSlider(0); }
+
+        slider.addEventListener('touchend', resetSlider);
+        slider.addEventListener('mouseup', resetSlider);
+        steerSlider.addEventListener('touchend', resetSteerSlider);
+        steerSlider.addEventListener('mouseup', resetSteerSlider);
+
+        window.onload = function() {
+            initWebSocket();
+            updateTemperatureUI(34);
+
+            ws.onmessage = function(event) {
+                if(event.data.startsWith("ALERT_")) {
+                    showToast(event.data.substring(6));
+                    return;
+                }
+
+                if(event.data.startsWith("LIGHT_STATE_")) {
+                    let st = event.data.substring(12) === "1";
+                    updateLightUIState(st);
+                    return;
+                }
+
+                try {
+                    let data = JSON.parse(event.data);
+                    
+                    if(data.dist !== undefined) document.getElementById('ui-dist').innerText = data.dist + " cm";
+                    if(data.wifi !== undefined) document.getElementById('wifi-signal-text').innerText = data.wifi + "%";
+                    if(data.ldr !== undefined) document.getElementById('ui-ldr').innerText = data.ldr;
+                    if(data.temp !== undefined) {
+                        document.getElementById('ui-temp').innerText = data.temp + " °C";
+                        updateTemperatureUI(data.temp);
+                    }
+                    if(data.blink !== undefined && activeWidget === "FACE") {
+                        if(data.blink) {
+                            eyeLeft.classList.add('blinking');
+                            eyeRight.classList.add('blinking');
+                        } else {
+                            eyeLeft.classList.remove('blinking');
+                            eyeRight.classList.remove('blinking');
+                        }
+                    }
+                } catch(e) {}
+            };
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// ------------------- SENSOR & HARDWARE LOGIC -------------------
+
+float getDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+  if (duration == 0) return 999.0;
+  return duration * 0.034 / 2.0;
+}
+
+int getInternalTemp() {
+  float rawTemp = (temprature_sens_read() - 32) / 1.8;
+  return (int)rawTemp - 12;
+}
+
+// ------------------- LIVE OLED DISPLAY MIRROR -------------------
+void drawOLED() {
+  u8g2.clearBuffer();
+
+  // web remote එක connect වන තෙක් (isConnectedToWeb == false) IP එක දිගටම පෙන්වයි
+  if (!isConnectedToWeb) {
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(5, 12, "SMART RC CAR");
+    u8g2.drawHLine(0, 16, 128);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    
+    if (isAPMode) {
+      u8g2.drawStr(0, 30, "Mode: Hotspot AP");
+      u8g2.drawStr(0, 44, ("IP: " + currentIP).c_str());
+      u8g2.drawStr(0, 58, "Pass: 12345678");
+    } else {
+      u8g2.drawStr(0, 30, "Mode: Wi-Fi STA");
+      u8g2.drawStr(0, 44, ("IP: " + currentIP).c_str());
+      u8g2.drawStr(0, 58, "Waiting Web Connect...");
+    }
+  } 
+  else {
+    // 1. Live Cyber Face Mirroring on OLED
+    if (activeWidget == "FACE") {
+      int offsetX = map(currentSteer, -100, 100, -7, 7);
+      int offsetY = map(currentSpeed, -100, 100, 5, -5);
+
+      if (isBlinking) {
+        // Blinking state (Horizontal lines)
+        u8g2.drawHLine(20, 32, 30);
+        u8g2.drawHLine(78, 32, 30);
+      } else {
+        // Normal state with pupil motion
+        u8g2.drawCircle(35, 32, 16);
+        u8g2.drawCircle(93, 32, 16);
+        u8g2.drawDisc(35 + offsetX, 32 + offsetY, 6);
+        u8g2.drawDisc(93 + offsetX, 32 + offsetY, 6);
+      }
+      u8g2.drawHLine(50, 56, 28); // Mouth
+    } 
+    // 2. Date & Time Widget
+    else if (activeWidget == "DATETIME") {
+      u8g2.setFont(u8g2_font_profont17_tr);
+      u8g2.drawStr(22, 30, liveTimeStr.c_str());
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(32, 52, liveDateStr.c_str());
+    } 
+    // 3. Custom Text Widget
+    else if (activeWidget == "TEXT") {
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      u8g2.drawStr(0, 14, "MESSAGE:");
+      u8g2.drawHLine(0, 18, 128);
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(0, 42, oledCustomText.c_str());
+    } 
+    // 4. Sensors Data Widget (OLED Mirroring + Live LDR)
+    else if (activeWidget == "SENSOR") {
+      float dist = getDistanceCM();
+      int temp = getInternalTemp();
+
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(0, 14, ("Dist : " + String(dist, 1) + " cm").c_str());
+      u8g2.drawStr(0, 30, ("LDR  : " + String(currentLdrValue)).c_str());
+      u8g2.drawStr(0, 46, ("Temp : " + String(temp) + " C").c_str());
+      u8g2.drawStr(0, 62, ("Spd: " + String(currentSpeed) + "% | Str: " + String(currentSteer) + "%").c_str());
+    }
+  }
+
+  u8g2.sendBuffer();
+}
+
+// Low speed එකේදී IC එක රත් වීම සහ ස්ටෝල් වීම වැළැක්වීමට Ramp & Minimum threshold logic එක එකතු කරන ලදී
+int smoothedSpeed = 0;
+const int minMotorSpeed = 30; // මෝටරය නොකැරකී හිරවී රත් වීම වැළැක්වීමේ threshold එක
+
+void applyRgbHardware() {
+  if (isRgbOn) {
+    analogWrite(RED_PIN, lastRgbR);
+    analogWrite(GREEN_PIN, lastRgbG);
+    analogWrite(BLUE_PIN, lastRgbB);
+  } else {
+    analogWrite(RED_PIN, 0);
+    analogWrite(GREEN_PIN, 0);
+    analogWrite(BLUE_PIN, 0);
+    digitalWrite(RED_PIN, LOW);
+    digitalWrite(GREEN_PIN, LOW);
+    digitalWrite(BLUE_PIN, LOW);
+  }
+}
+
+void applyMotorControl(int targetSpeedVal, int steerVal) {
+  float distance = getDistanceCM();
+
+  if (distance <= 3.0 && targetSpeedVal > 0) {
+    targetSpeedVal = 0; 
+  }
+
+  if (isParked) {
+    targetSpeedVal = 0;
+    steerVal = 0;
+  }
+
+  // Smooth Speed Ramping (Current Spikes පාලනය කිරීමට)
+  if (smoothedSpeed < targetSpeedVal) smoothedSpeed += 5;
+  else if (smoothedSpeed > targetSpeedVal) smoothedSpeed -= 5;
+
+  if (abs(smoothedSpeed - targetSpeedVal) < 5) {
+    smoothedSpeed = targetSpeedVal;
+  }
+
+  int effectiveSpeed = smoothedSpeed;
+
+  // Minimum Threshold Logic - low speed වලදී මෝටරය හිරවී IC එක රත් වීම වළක්වයි
+  if (abs(effectiveSpeed) > 0 && abs(effectiveSpeed) < minMotorSpeed) {
+    effectiveSpeed = (effectiveSpeed > 0) ? minMotorSpeed : -minMotorSpeed;
+  }
+
+  
+    if (isParked) {
+    // Park Mode ON වී ඇති විට Steering auto lights වැඩ නොකරයි
+    } else if (abs(steerVal) > 15) {
+    int pwmValue = map(abs(steerVal), 0, 100, 50, 140);
+    if (steerVal < 0) {
+      digitalWrite(ARROW_LEFT_PIN, HIGH);
+      digitalWrite(ARROW_RIGHT_PIN, LOW);
+      ledcWrite(IN1_PIN, pwmValue); ledcWrite(IN2_PIN, 0);
+      ledcWrite(IN3_PIN, 0);       ledcWrite(IN4_PIN, pwmValue);
+    } else {
+      digitalWrite(ARROW_LEFT_PIN, LOW);
+      digitalWrite(ARROW_RIGHT_PIN, HIGH);
+      ledcWrite(IN1_PIN, 0);       ledcWrite(IN2_PIN, pwmValue);
+      ledcWrite(IN3_PIN, pwmValue);ledcWrite(IN4_PIN, 0);
+    }
+  } else if (abs(effectiveSpeed) > 0) {
+    digitalWrite(ARROW_LEFT_PIN, LOW);
+    digitalWrite(ARROW_RIGHT_PIN, LOW);
+    int pwmValue = map(abs(effectiveSpeed), 0, 100, 80, 255);
+
+    if (effectiveSpeed > 0) {
+      ledcWrite(IN1_PIN, 0);       ledcWrite(IN2_PIN, pwmValue);
+      ledcWrite(IN3_PIN, 0);       ledcWrite(IN4_PIN, pwmValue);
+    } else {
+      ledcWrite(IN1_PIN, pwmValue);ledcWrite(IN2_PIN, 0);
+      ledcWrite(IN3_PIN, pwmValue);ledcWrite(IN4_PIN, 0);
+    }
+  } else {
+    digitalWrite(ARROW_LEFT_PIN, LOW);
+    digitalWrite(ARROW_RIGHT_PIN, LOW);
+    ledcWrite(IN1_PIN, 0); ledcWrite(IN2_PIN, 0);
+    ledcWrite(IN3_PIN, 0); ledcWrite(IN4_PIN, 0);
+  }
+}
+
+void handleAutoMode() {
+  float distance = getDistanceCM();
+  unsigned long currentMillis = millis();
+
+  switch (autoState) {
+    case 0: // ඉදිරියට යෑම
+      if (distance < 20.0) {
+        applyMotorControl(0, 0); // නවතින්න
+        autoPreviousMillis = currentMillis;
+        autoState = 1;
+      } else {
+        applyMotorControl(60, 0); // ඉදිරියට යන්න
+      }
+      break;
+
+    case 1: // 100ms නවතින්න
+      if (currentMillis - autoPreviousMillis >= 100) {
+        applyMotorControl(-50, 0); // පසුපසට
+        autoPreviousMillis = currentMillis;
+        autoState = 2;
+      }
+      break;
+
+    case 2: // 300ms පසුපසට යන්න
+      if (currentMillis - autoPreviousMillis >= 300) {
+        applyMotorControl(0, -80); // හරවන්න
+        autoPreviousMillis = currentMillis;
+        autoState = 3;
+      }
+      break;
+
+    case 3: // 400ms හැරෙන්න
+      if (currentMillis - autoPreviousMillis >= 400) {
+        applyMotorControl(0, 0); // නවතින්න
+        autoPreviousMillis = currentMillis;
+        autoState = 4;
+      }
+      break;
+
+    case 4: // 100ms පසු නැවත පරීක්ෂා කරන්න
+      if (currentMillis - autoPreviousMillis >= 100) {
+        autoState = 0;
+      }
+      break;
+  }
+}
+
+// WebSocket Command Processor
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+               AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  
+  if (type == WS_EVT_CONNECT) {
+  } 
+  else if (type == WS_EVT_DISCONNECT) {
+    if (ws.count() == 0) {
+      isConnectedToWeb = false;
+    }
+  } 
+  else if (type == WS_EVT_DATA) {
+    String msg = "";
+    for (size_t i = 0; i < len; i++) msg += (char)data[i];
+
+    if (msg == "CLIENT_CONNECTED") {
+      isConnectedToWeb = true; // Dashboard එක connect වූ පසු Screen එක මාරු වෙයි
+      ws.textAll("LIGHT_STATE_" + String(actualLightState ? "1" : "0"));
+    }
+    else if (msg.startsWith("WIFI_CONNECT_")) {
+      int firstIdx = msg.indexOf('_', 13);
+      String ssid = msg.substring(13, firstIdx);
+      String pass = msg.substring(firstIdx + 1);
+
+      WiFi.disconnect(true);
+      delay(100);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(ssid.c_str(), pass.c_str());
+
+      int timeout = 0;
+      while (WiFi.status() != WL_CONNECTED && timeout < 30) {
+        delay(500);
+        timeout++;
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
+        isAPMode = false;
+        currentIP = WiFi.localIP().toString();
+      } else {
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP("Smart_RC_Car", "12345678");
+        currentIP = WiFi.softAPIP().toString();
+        isAPMode = true;
+      }
+      isConnectedToWeb = false; // Connect වූ පසු නැවත Remote Page එක open කරන තුරු IP එක පෙන්වයි
+    } 
+    else if (msg.startsWith("SPEED_")) { currentSpeed = msg.substring(6).toInt(); } 
+    else if (msg.startsWith("STEER_")) { currentSteer = msg.substring(6).toInt(); } 
+    else if (msg == "PARK_ON") { isParked = true; }
+    else if (msg == "PARK_OFF") { 
+       isParked = false; 
+       digitalWrite(ARROW_LEFT_PIN, LOW);
+       digitalWrite(ARROW_RIGHT_PIN, LOW);
+    }
+    else if (msg == "MODE_RC") { sysMode = "RC"; }
+    else if (msg == "MODE_AUTO") { sysMode = "AUTO"; }
+    else if (msg == "LIGHT_ON") { 
+      manualLightState = true; 
+      setHeadlightHardware(true);
+      ws.textAll("LIGHT_STATE_1");
+    }
+    else if (msg == "LIGHT_OFF") { 
+      manualLightState = false; 
+      setHeadlightHardware(false);
+      ws.textAll("LIGHT_STATE_0");
+    }
+    else if (msg.startsWith("HEADLIGHT_BRIGHTNESS_")) {
+      int val = msg.substring(21).toInt();
+      headlightBrightness = map(val, 0, 100, 0, 255);
+      if (actualLightState) {
+        setHeadlightHardware(true);
+      }
+    }
+    else if (msg == "TOGGLE_AUTO_LDR") {
+      autoLdrEnabled = !autoLdrEnabled;
+      if (autoLdrEnabled) {
+        ws.textAll("ALERT_Auto LDR Control: ON");
+      } else {
+        ws.textAll("ALERT_Auto LDR Control: OFF");
+      }
+    }
+
+    // RGB Controls (අලුතින් එකතු කළ කොටස)
+    else if (msg == "RGB_ON") {
+      isRgbOn = true;
+      applyRgbHardware();
+    }
+    else if (msg == "RGB_OFF") {
+      isRgbOn = false;
+      applyRgbHardware();
+    }
+    else if (msg.startsWith("RGB_COLOR_")) {
+      String hexColor = msg.substring(10);
+      long number = strtol(hexColor.c_str(), NULL, 16);
+      lastRgbR = (number >> 16) & 0xFF;
+      lastRgbG = (number >> 8) & 0xFF;
+      lastRgbB = number & 0xFF;
+      
+      isRgbOn = true;
+      applyRgbHardware();
+    }
+
+    else if (msg.startsWith("WIDGET_")) { activeWidget = msg.substring(7); }
+    else if (msg.startsWith("CUSTOM_TEXT_")) {
+      oledCustomText = msg.substring(12);
+      activeWidget = "TEXT";
+    }
+    else if (msg.startsWith("DATETIME_")) {
+      int idx = msg.indexOf('_', 9);
+      liveTimeStr = msg.substring(9, idx);
+      liveDateStr = msg.substring(idx + 1);
+    }
+  }
+}
+
+// ------------------- SETUP -------------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LDR_PIN, INPUT);
+  pinMode(ARROW_LEFT_PIN, OUTPUT);
+  pinMode(ARROW_RIGHT_PIN, OUTPUT);
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(BLUE_PIN, OUTPUT);
+
+  // Attach PWM for Motors
+  ledcAttach(IN1_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(IN2_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(IN3_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(IN4_PIN, PWM_FREQ, PWM_RES);
+
+  // Attach PWM Channel for Headlight Brightness
+  ledcAttach(HEADLIGHT_PIN, PWM_FREQ, PWM_RES);
+  setHeadlightHardware(false);
+
+  u8g2.begin();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("Smart_RC_Car", "12345678");
+  currentIP = WiFi.softAPIP().toString();
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (isAPMode) {
+      request->send_P(200, "text/html", WIFI_SETUP_HTML);
+    } else {
+      request->send_P(200, "text/html", REMOTE_HTML);
+    }
+  });
+
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.begin();
+}
+
+// ------------------- MAIN LOOP -------------------
+unsigned long lastUpdate = 0;
+unsigned long lastOledRefresh = 0;
+
+void loop() {
+  ws.cleanupClients();
+
+  // Park Blink Logic (Park එබූ විට Arrow Lights දෙකම Blink වේ)
+  static unsigned long lastParkBlink = 0;
+  static bool parkBlinkState = false;
+
+  if (isParked) {
+    if (millis() - lastParkBlink > 500) { // millisecond 500ට වරක්
+      lastParkBlink = millis();
+      parkBlinkState = !parkBlinkState;
+      digitalWrite(ARROW_LEFT_PIN, parkBlinkState ? HIGH : LOW);
+      digitalWrite(ARROW_RIGHT_PIN, parkBlinkState ? HIGH : LOW);
+    }
+  }
+
+  // Read LDR Sensor Value
+  currentLdrValue = analogRead(LDR_PIN);
+
+  // Auto LDR Control Logic based on Settings A button state
+  if (autoLdrEnabled) {
+    if (currentLdrValue < 1250) {
+      if (!actualLightState) {
+        setHeadlightHardware(true);
+        ws.textAll("LIGHT_STATE_1");
+      }
+    } else {
+      if (!manualLightState && actualLightState) {
+        setHeadlightHardware(false);
+        ws.textAll("LIGHT_STATE_0");
+      }
+    }
+  }
+
+  // Random Blink Engine (Sync OLED & Web UI Face)
+  if (millis() - lastBlinkTime > (isBlinking ? 150 : 3500)) {
+    lastBlinkTime = millis();
+    isBlinking = !isBlinking;
+    
+    if (activeWidget == "FACE") {
+      String blinkJson = "{\"blink\":" + String(isBlinking ? "true" : "false") + "}";
+      ws.textAll(blinkJson);
+    }
+  }
+  if (sysMode == "RC") {
+    applyMotorControl(currentSpeed, currentSteer);
+  } else if (sysMode == "AUTO") {
+    handleAutoMode();
+  }
+
+
+  
+  // WiFi Signal Strength Sender (~2 Seconds Interval)
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 1000) {
+    lastWifiCheck = millis();
+    int rssi = WiFi.RSSI();
+    int quality = 0;
+    if (rssi <= -100) quality = 0;
+    else if (rssi >= -50) quality = 100;
+    else quality = 2 * (rssi + 100);
+
+    String wifiJson = "{\"wifi\":" + String(quality) + "}";
+    ws.textAll(wifiJson);
+  }
+
+  // Screen Refresh Rate (~15 FPS)
+  if (millis() - lastOledRefresh > 65) {
+    lastOledRefresh = millis();
+    drawOLED();
+  }
+
+  // Sensor Broadcast Loop (300ms real-time sync to Remote Dashboard)
+  if (millis() - lastUpdate > 300) {
+    lastUpdate = millis();
+    int envTemp = getInternalTemp();
+    float dist = getDistanceCM();
+
+    String jsonMsg = "{\"temp\":" + String(envTemp) + ",\"dist\":" + String(dist, 1) + ",\"ldr\":" + String(currentLdrValue) + "}";
+    ws.textAll(jsonMsg);
+  }
+}
