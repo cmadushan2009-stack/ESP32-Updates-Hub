@@ -17,6 +17,10 @@
             --success-text: #34d399;
         }
 
+        * {
+            box-sizing: border-box;
+        }
+
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background-color: var(--bg-color);
@@ -65,13 +69,15 @@
 
         select {
             width: 100%;
-            padding: 10px;
+            padding: 12px;
             background-color: #1e293b;
             border: 1px solid var(--card-border);
             border-radius: 6px;
             color: var(--text-main);
-            font-size: 15px;
+            font-size: 16px; /* Prevents auto-zoom on mobile browsers */
             outline: none;
+            -webkit-appearance: none;
+            appearance: none;
         }
 
         select:focus {
@@ -85,6 +91,7 @@
             margin-top: 15px;
             border-radius: 6px;
             display: none;
+            word-break: break-word;
         }
 
         .badge {
@@ -95,15 +102,23 @@
             border-radius: 12px;
             font-weight: bold;
             margin-left: 8px;
+            display: inline-block;
+        }
+
+        /* Mobile-Friendly Table Wrapper */
+        .table-responsive {
+            width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            border-radius: 8px;
+            border: 1px solid var(--card-border);
+            background-color: var(--card-bg);
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            background-color: var(--card-bg);
-            border-radius: 8px;
-            overflow: hidden;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+            min-width: 480px; /* Ensures table doesn't compress too tightly on small phones */
         }
 
         th, td {
@@ -116,6 +131,7 @@
         th {
             background-color: #1e293b;
             color: var(--accent-color);
+            white-space: nowrap;
         }
 
         tr:hover {
@@ -125,18 +141,45 @@
         .btn-download {
             background-color: var(--accent-color);
             color: #020617;
-            padding: 6px 14px;
+            padding: 8px 16px;
             text-decoration: none;
             border-radius: 6px;
             font-size: 0.85rem;
             font-weight: 600;
             display: inline-block;
             transition: background 0.2s;
+            text-align: center;
         }
 
         .btn-download:hover {
             background-color: var(--accent-hover);
             color: #ffffff;
+        }
+
+        /* Responsive Breakpoints for Mobile Phones */
+        @media (max-width: 600px) {
+            body {
+                padding: 12px;
+            }
+
+            h1 {
+                font-size: 1.4rem;
+                margin-bottom: 18px;
+            }
+
+            .box {
+                padding: 15px;
+            }
+
+            th, td {
+                padding: 10px 8px;
+                font-size: 0.85rem;
+            }
+
+            .btn-download {
+                padding: 6px 12px;
+                font-size: 0.8rem;
+            }
         }
     </style>
 </head>
@@ -166,23 +209,24 @@
 
     <!-- Release Table -->
     <h3>📜 Release History</h3>
-    <table>
-        <thead>
-            <tr>
-                <th>Version</th>
-                <th>Release Date</th>
-                <th>File Name</th>
-                <th>Action</th>
-            </tr>
-        </thead>
-        <tbody id="tableBody">
-        </tbody>
-    </table>
+    <div class="table-responsive">
+        <table>
+            <thead>
+                <tr>
+                    <th>Version</th>
+                    <th>Release Date</th>
+                    <th>File Name</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="tableBody">
+            </tbody>
+        </table>
+    </div>
 </div>
 
 <script>
     // List of firmware / text updates
-    // Upload your .txt files to the same GitHub repository folder as index.html
     const releases = [
         {
             version: "v1.0.2",
@@ -190,8 +234,21 @@
             fileName: "update_v1.0.2.txt",
             notes: "Bug fixes for Wi-Fi reconnection and power optimization.",
             url: "update_v1.0.2.txt"
+        },
+        {
+            version: "v1.0.1",
+            date: "2026-02-15",
+            fileName: "update_v1.0.1.txt",
+            notes: "Added OTA update config and fixed MQTT packet handling.",
+            url: "update_v1.0.1.txt"
+        },
+        {
+            version: "v1.0.0",
+            date: "2026-01-10",
+            fileName: "update_v1.0.0.txt",
+            notes: "Initial release of ESP32 configuration file.",
+            url: "update_v1.0.0.txt"
         }
-       
     ];
 
     window.onload = function() {
