@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Updates Hub</title>
+    <style>
+        :root {
+            --bg-color: #070c18;
+            --card-bg: #0f172a;
+            --card-border: #1e293b;
+            --accent-color: #38bdf8;
+            --accent-hover: #0284c7;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --success-bg: #064e3b;
+            --success-text: #34d399;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 850px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            color: var(--text-main);
+            font-size: 1.8rem;
+            margin-bottom: 25px;
+        }
+
+        h3 {
+            margin-top: 0;
+            color: var(--accent-color);
+            font-size: 1.2rem;
+        }
+
+        .box {
+            background-color: var(--card-bg);
+            border: 1px solid var(--card-border);
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 25px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+        }
+
+        .form-group {
+            margin-bottom: 10px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 6px;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        select {
+            width: 100%;
+            padding: 10px;
+            background-color: #1e293b;
+            border: 1px solid var(--card-border);
+            border-radius: 6px;
+            color: var(--text-main);
+            font-size: 15px;
+            outline: none;
+        }
+
+        select:focus {
+            border-color: var(--accent-color);
+        }
+
+        .details-card {
+            background-color: #1e293b;
+            border-left: 4px solid var(--accent-color);
+            padding: 15px;
+            margin-top: 15px;
+            border-radius: 6px;
+            display: none;
+        }
+
+        .badge {
+            background-color: var(--success-bg);
+            color: var(--success-text);
+            font-size: 0.75rem;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-weight: bold;
+            margin-left: 8px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: var(--card-bg);
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+        }
+
+        th, td {
+            text-align: left;
+            padding: 12px;
+            border-bottom: 1px solid var(--card-border);
+            font-size: 0.95rem;
+        }
+
+        th {
+            background-color: #1e293b;
+            color: var(--accent-color);
+        }
+
+        tr:hover {
+            background-color: rgba(255, 255, 255, 0.02);
+        }
+
+        .btn-download {
+            background-color: var(--accent-color);
+            color: #020617;
+            padding: 6px 14px;
+            text-decoration: none;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: inline-block;
+            transition: background 0.2s;
+        }
+
+        .btn-download:hover {
+            background-color: var(--accent-hover);
+            color: #ffffff;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>⚡ ESP32 Updates Dashboard</h1>
+
+    <!-- Dropdown Selector -->
+    <div class="box">
+        <h3>🔍 Select Version Details</h3>
+        <div class="form-group">
+            <label for="releaseSelect">Release Version:</label>
+            <select id="releaseSelect" onchange="showReleaseDetails()">
+                <option value="">-- Choose a Version --</option>
+            </select>
+        </div>
+
+        <div id="releaseCard" class="details-card">
+            <h4 id="detailTitle" style="margin-top:0; color: var(--text-main);"></h4>
+            <p><strong>Release Date:</strong> <span id="detailDate"></span></p>
+            <p><strong>File Name:</strong> <span id="detailFileName"></span></p>
+            <p><strong>Notes:</strong> <span id="detailNotes"></span></p>
+            <a id="detailDownload" href="#" class="btn-download" download>Download File</a>
+        </div>
+    </div>
+
+    <!-- Release Table -->
+    <h3>📜 Release History</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Version</th>
+                <th>Release Date</th>
+                <th>File Name</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody id="tableBody">
+        </tbody>
+    </table>
+</div>
+
+<script>
+    // List of firmware / text updates
+    // Upload your .txt files to the same GitHub repository folder as index.html
+    const releases = [
+        {
+            version: "v1.0.2",
+            date: "2026-03-20",
+            fileName: "update_v1.0.2.txt",
+            notes: "Bug fixes for Wi-Fi reconnection and power optimization.",
+            url: "update_v1.0.2.txt"
+        }
+       
+    ];
+
+    window.onload = function() {
+        // Automatically sort releases by date descending (Newest date on top)
+        releases.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+        const selectMenu = document.getElementById('releaseSelect');
+        const tableBody = document.getElementById('tableBody');
+
+        releases.forEach((rel, index) => {
+            const isLatest = index === 0;
+            const badgeText = isLatest ? " ⭐ (Latest)" : "";
+
+            // Populate Dropdown
+            const option = document.createElement('option');
+            option.value = index;
+            option.textContent = `${rel.version} - ${rel.date}${badgeText}`;
+            selectMenu.appendChild(option);
+
+            // Populate Table
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td><strong>${rel.version}</strong> ${isLatest ? '<span class="badge">LATEST</span>' : ''}</td>
+                <td>${rel.date}</td>
+                <td>${rel.fileName}</td>
+                <td><a href="${rel.url}" class="btn-download" download>Download</a></td>
+            `;
+            tableBody.appendChild(row);
+        });
+    };
+
+    // Display details card when a version is selected
+    function showReleaseDetails() {
+        const selectMenu = document.getElementById('releaseSelect');
+        const card = document.getElementById('releaseCard');
+        const index = selectMenu.value;
+
+        if (index === "") {
+            card.style.display = "none";
+            return;
+        }
+
+        const rel = releases[index];
+        document.getElementById('detailTitle').innerText = "Version " + rel.version;
+        document.getElementById('detailDate').innerText = rel.date;
+        document.getElementById('detailFileName').innerText = rel.fileName;
+        document.getElementById('detailNotes').innerText = rel.notes;
+
+        const downloadBtn = document.getElementById('detailDownload');
+        downloadBtn.href = rel.url;
+
+        card.style.display = "block";
+    }
+</script>
+
+</body>
+</html>
